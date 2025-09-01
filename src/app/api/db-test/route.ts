@@ -19,7 +19,18 @@ export async function GET() {
 
     // Connect and run a trivial query
     const conn = await mysql.createConnection({ host, port, user, password, database });
-    const [rows] = await conn.query('SELECT 1 AS ok LIMIT 1');
+    const [rows] = await conn.query(`
+      SELECT id,
+            qid,
+            category,
+            note,
+            status,
+            is_completed,
+            FROM_UNIXTIME(date, '%Y-%m-%d %H:%i:%s') AS check_time
+      FROM daily_check
+      LIMIT 20
+    `);
+
     await conn.end();
 
     return NextResponse.json({ ok: true, rows });
