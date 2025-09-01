@@ -1,3 +1,11 @@
+// Guardrails for generated SQL
+// - Only SELECT
+// - Only whitelisted tables/columns
+// - Require LIMIT <= 1000
+// - Allow FROM_UNIXTIME()
+// - Allow safe aliases (like "daily_check d")
+// - Allow aggregates (COUNT, SUM, AVG, MIN, MAX) with aliases
+
 const ALLOWED_TABLES = [
   'temperature',
   'core_temperature',
@@ -45,6 +53,11 @@ const ALLOWED_COLUMNS: Record<(typeof ALLOWED_TABLES)[number], string[]> = {
   ],
 };
 
+// allowed join
+const ALLOWED_JOINS = [
+  { left: 'daily_check', colL: 'qid', right: 'template', colR: 'id' },
+];
+
 const DISALLOWED = [
   'INSERT','UPDATE','DELETE','DROP','TRUNCATE','ALTER','CREATE','GRANT',
   'REVOKE','MERGE','CALL','DESCRIBE','SHOW','INTO','OUTFILE','INFILE'
@@ -52,45 +65,76 @@ const DISALLOWED = [
 
 export function isSafeSql(sql?: string) {
   if (!sql || typeof sql !== 'string') return false;
+
   const q = sql.replace(/\s+/g,' ').trim();
   const upper = q.toUpperCase();
 
-  // Only SELECT
+  // 1) Only SELECT
   if (!upper.startsWith('SELECT ')) return false;
 
-  // No semicolons or comments
+  // 2) No semicolons or comments
   if (q.includes(';') || q.includes('--') || q.includes('/*') || q.includes('*/')) return false;
 
-  // Block dangerous keywords
+  // 3) Block dangerous keywords
   if (DISALLOWED.some(k => new RegExp(`\\b${k}\\b`, 'i').test(q))) return false;
 
-  // All referenced tables must be allowed
+  // 4) All referenced tables must be allowed (ignore aliases)
   const tableMatches = [
-    ...q.matchAll(/\bFROM\s+([a-zA-Z0-9_]+)/gi),
-    ...q.matchAll(/\bJOIN\s+([a-zA-Z0-9_]+)/gi),
+    ...q.matchAll(/\bFROM\s+([a-zA-Z0-9_]+)(?:\s+[a-z])?/gi),
+    ...q.matchAll(/\bJOIN\s+([a-zA-Z0-9_]+)(?:\s+[a-z])?/gi),
   ];
   const tables = tableMatches.map(m => m[1].toLowerCase());
   if (!tables.length || !tables.every(t => (ALLOWED_TABLES as readonly string[]).includes(t))) return false;
 
-  // Basic column whitelist on SELECT list (best effort)
+  // 5) Validate SELECT list columns (best-effort)
   const selectClause = q.split(/\bfrom\b/i)[0].replace(/^select/i,'').trim();
   if (selectClause !== '*') {
     const cols = selectClause.split(',').map(s => s.trim());
     const baseCols = cols.map(c => {
-      const func = c.match(/^[A-Z_]+\((.+)\)$/i);
-      const inner = func ? func[1] : c;
-      const left = inner.split(/\sas\s/i)[0];
-      return left.split('.').pop()?.replace(/`/g,'').trim();
+      if (/^COUNT\(\*\)/i.test(c)) return '*';
+      if (/^FROM_UNIXTIME\(.+\)/i.test(c)) return 'FROM_UNIXTIME';
+
+      // ✅ strip alias
+      const noAlias = c.split(/\s+AS\s+/i)[0].trim();
+
+      // ✅ check for aggregates with column
+      const aggMatch = noAlias.match(/^(SUM|AVG|MIN|MAX|COUNT)\((.+)\)$/i);
+      if (aggMatch) {
+        const innerCol = aggMatch[2].split('.')[0].replace(/`/g,'').trim();
+        return innerCol;
+      }
+
+      const bare = noAlias.split('.').pop()?.replace(/`/g,'').trim();
+      return bare || '';
     }).filter(Boolean) as string[];
+
     const allAllowed = baseCols.every(col =>
-      col === '*' || /^COUNT\(\*\)$/i.test(col) ||
+      col === '*' ||
+      col === 'FROM_UNIXTIME' ||
       Object.values(ALLOWED_COLUMNS).some(list => list.includes(col))
     );
     if (!allAllowed) return false;
   }
 
-  // Require LIMIT
-  if (!/\bLIMIT\s+\d+\b/i.test(q)) return false;
+  // 6) JOINs must match whitelist
+  const joinConds = [...q.matchAll(/\bJOIN\s+([a-zA-Z0-9_]+)\s+ON\s+([a-zA-Z0-9_.`]+)\s*=\s*([a-zA-Z0-9_.`]+)/gi)];
+  for (const m of joinConds) {
+    const leftSide = m[2].replace(/`/g,'').split('.');
+    const rightSide = m[3].replace(/`/g,'').split('.');
+    if (leftSide.length !== 2 || rightSide.length !== 2) return false;
+    const [tL, cL] = leftSide;
+    const [tR, cR] = rightSide;
+    const ok = ALLOWED_JOINS.some(j =>
+      ((tL === j.left && cL === j.colL && tR === j.right && cR === j.colR) ||
+       (tL === j.right && cL === j.colR && tR === j.left && cR === j.colL))
+    );
+    if (!ok) return false;
+  }
+
+  // 7) LIMIT present and bounded
+  const limit = q.match(/\bLIMIT\s+(\d+)\b/i);
+  if (!limit) return false;
+  if (Number(limit[1]) > 1000) return false;
 
   return true;
 }
