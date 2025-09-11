@@ -4,7 +4,8 @@
 // - Require LIMIT <= 1000
 // - Allow FROM_UNIXTIME()
 // - Allow safe aliases (like "daily_check d")
-// - Allow aggregates (COUNT, SUM, AVG, MIN, MAX) with aliases
+// - Allow account_id filters
+// - Allow exactly one safe JOIN: daily_check.qid = template.id
 
 const ALLOWED_TABLES = [
   'temperature',
@@ -15,41 +16,62 @@ const ALLOWED_TABLES = [
   'daily_check',
   'check',
   'template',
-  'wm_check'
+  'wm_check',
+  'restaurant'
 ] as const;
+
+const COMMON_COLUMNS = ['account_id', 'restaurant_id', 'id'];
 
 const ALLOWED_COLUMNS: Record<(typeof ALLOWED_TABLES)[number], string[]> = {
   temperature: [
-    'id','equipment','dev_eui','bat_v','bat_status','hum_sht','temp_ds','temp_sht','temp_calc',
-    'date','restaurant_id','token','status'
+    ...COMMON_COLUMNS,
+    'equipment','dev_eui','bat_v','bat_status','hum_sht',
+    'temp_ds','temp_sht','temp_calc','date','token','status'
   ],
   core_temperature: [
-    'id','dish_id','temperature','re_temperature','remarks','restaurant_id','type','status',
-    'retest','iteration','created_at','updated_at','created_by','updated_by','token'
+    ...COMMON_COLUMNS,
+    'dish_id','temperature','re_temperature','remarks',
+    'type','status','retest','iteration',
+    'created_at','updated_at','created_by','updated_by','token'
   ],
   daily_core_temp: [
-    'id','note','type','date','restaurant_id','created_by','updated_by','updated_at','created_at','status','token'
+    ...COMMON_COLUMNS,
+    'note','type','date','created_by','updated_by',
+    'updated_at','created_at','status','token'
   ],
   daily_hot_hold: [
-    'id','note','type','date','restaurant_id','created_by','updated_by','updated_at','created_at','status','token'
+    ...COMMON_COLUMNS,
+    'note','type','date','created_by','updated_by',
+    'updated_at','created_at','status','token'
   ],
   hot_holding: [
-    'id','dish_id','equipment_id','start','end','temperature','re_temperature','restaurant_id','type','remarks',
-    'created_at','updated_at','created_by','updated_by','token','status','retest','iteration','trash'
+    ...COMMON_COLUMNS,
+    'dish_id','equipment_id','start','end','temperature','re_temperature',
+    'type','remarks','created_at','updated_at','created_by','updated_by',
+    'token','status','retest','iteration','trash'
   ],
   daily_check: [
-    'id','qid','category','image','note','status','start','end','reference','restaurant_id','area',
-    'created_by','updated_by','date','token','is_completed'
+    ...COMMON_COLUMNS,
+    'qid','category','image','note','status','start','end',
+    'reference','area','created_by','updated_by','date',
+    'token','is_completed'
   ],
   check: [
-    'id','qid','category','image','note','status','start','end','reference','restaurant_id','area',
-    'created_by','updated_by','date','token','is_completed'
+    ...COMMON_COLUMNS,
+    'qid','category','image','note','status','start','end',
+    'reference','area','created_by','updated_by','date',
+    'token','is_completed'
   ],
   template: [
-    'id','name','file','created_by','updated_by','created_at','updated_at','status','trash','token'
+    'id','name','file','created_by','updated_by',
+    'created_at','updated_at','status','trash','token'
   ],
   wm_check: [
-    'id','date','restaurant_id','token','type','status'
+    ...COMMON_COLUMNS,
+    'date','token','type','status'
+  ],
+  restaurant: [
+    'id','account_id'
   ],
 };
 
@@ -69,16 +91,14 @@ export function isSafeSql(sql?: string) {
   const q = sql.replace(/\s+/g,' ').trim();
   const upper = q.toUpperCase();
 
-  // 1) Only SELECT
+  // Only SELECT
   if (!upper.startsWith('SELECT ')) return false;
 
-  // 2) No semicolons or comments
+  // Block obvious dangers
   if (q.includes(';') || q.includes('--') || q.includes('/*') || q.includes('*/')) return false;
-
-  // 3) Block dangerous keywords
   if (DISALLOWED.some(k => new RegExp(`\\b${k}\\b`, 'i').test(q))) return false;
 
-  // 4) All referenced tables must be allowed (ignore aliases)
+  // Check tables
   const tableMatches = [
     ...q.matchAll(/\bFROM\s+([a-zA-Z0-9_]+)(?:\s+[a-z])?/gi),
     ...q.matchAll(/\bJOIN\s+([a-zA-Z0-9_]+)(?:\s+[a-z])?/gi),
@@ -86,27 +106,18 @@ export function isSafeSql(sql?: string) {
   const tables = tableMatches.map(m => m[1].toLowerCase());
   if (!tables.length || !tables.every(t => (ALLOWED_TABLES as readonly string[]).includes(t))) return false;
 
-  // 5) Validate SELECT list columns (best-effort)
+  // Check columns (best effort)
   const selectClause = q.split(/\bfrom\b/i)[0].replace(/^select/i,'').trim();
   if (selectClause !== '*') {
     const cols = selectClause.split(',').map(s => s.trim());
     const baseCols = cols.map(c => {
-      if (/^COUNT\(\*\)/i.test(c)) return '*';
-      if (/^FROM_UNIXTIME\(.+\)/i.test(c)) return 'FROM_UNIXTIME';
-
-      // ✅ strip alias
-      const noAlias = c.split(/\s+AS\s+/i)[0].trim();
-
-      // ✅ check for aggregates with column
-      const aggMatch = noAlias.match(/^(SUM|AVG|MIN|MAX|COUNT)\((.+)\)$/i);
-      if (aggMatch) {
-        const innerCol = aggMatch[2].split('.')[0].replace(/`/g,'').trim();
-        return innerCol;
-      }
-
+      if (/^COUNT\(\*\)$/i.test(c)) return '*';
+      if (/^FROM_UNIXTIME\(.+\)$/i.test(c)) return 'FROM_UNIXTIME';
+      const func = c.match(/^[A-Z_]+\((.+)\)$/i);
+      const noAlias = (func ? func[1] : c).split(/\sas\s/i)[0];
       const bare = noAlias.split('.').pop()?.replace(/`/g,'').trim();
       return bare || '';
-    }).filter(Boolean) as string[];
+    }).filter(Boolean);
 
     const allAllowed = baseCols.every(col =>
       col === '*' ||
@@ -116,7 +127,7 @@ export function isSafeSql(sql?: string) {
     if (!allAllowed) return false;
   }
 
-  // 6) JOINs must match whitelist
+  // Allow whitelisted JOINs
   const joinConds = [...q.matchAll(/\bJOIN\s+([a-zA-Z0-9_]+)\s+ON\s+([a-zA-Z0-9_.`]+)\s*=\s*([a-zA-Z0-9_.`]+)/gi)];
   for (const m of joinConds) {
     const leftSide = m[2].replace(/`/g,'').split('.');
@@ -131,7 +142,7 @@ export function isSafeSql(sql?: string) {
     if (!ok) return false;
   }
 
-  // 7) LIMIT present and bounded
+  // Require LIMIT
   const limit = q.match(/\bLIMIT\s+(\d+)\b/i);
   if (!limit) return false;
   if (Number(limit[1]) > 1000) return false;
