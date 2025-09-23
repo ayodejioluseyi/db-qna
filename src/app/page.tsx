@@ -22,7 +22,7 @@ export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(false);
 
-  const accountId = 53;
+  const restaurantId = 53;
 
   const now = () =>
     new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -41,7 +41,7 @@ export default function Home() {
       const res = await fetch('/api/ask', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, accountId }),
+        body: JSON.stringify({ question, restaurantId }),
       });
       const data = await res.json();
 
