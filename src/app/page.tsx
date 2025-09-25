@@ -22,8 +22,6 @@ export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(false);
 
-  const restaurantId = 53;
-
   const now = () =>
     new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
@@ -31,6 +29,7 @@ export default function Home() {
     e.preventDefault();
     if (!question.trim()) return;
 
+    // Add the user's message to the chat
     setMessages((prev) => [
       ...prev,
       { role: 'user', content: question, timestamp: now() },
@@ -38,13 +37,15 @@ export default function Home() {
     setLoading(true);
 
     try {
+      // Send ONLY the question; the API will auto-detect restaurant id
       const res = await fetch('/api/ask', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, restaurantId }),
+        body: JSON.stringify({ question }),
       });
       const data = await res.json();
 
+      // Add assistant's reply
       setMessages((prev) => [
         ...prev,
         {
@@ -75,7 +76,13 @@ export default function Home() {
   }
 
   // a tiny helper to render chips (reused in two places)
-  function Chips({ examples, compact = false }: { examples: string[]; compact?: boolean }) {
+  function Chips({
+    examples,
+    compact = false,
+  }: {
+    examples: string[];
+    compact?: boolean;
+  }) {
     return (
       <div className={`flex flex-wrap gap-2 ${compact ? '' : 'mt-2'}`}>
         {examples.map((ex) => (
@@ -132,7 +139,9 @@ export default function Home() {
               </div>
               <span
                 className={`text-xs mt-1 ${
-                  msg.role === 'user' ? 'text-right text-gray-200' : 'text-left text-gray-500'
+                  msg.role === 'user'
+                    ? 'text-right text-gray-200'
+                    : 'text-left text-gray-500'
                 }`}
               >
                 {msg.timestamp}
@@ -141,7 +150,9 @@ export default function Home() {
           ))}
 
           {loading && (
-            <div className="bg-gray-200 text-gray-600 p-3 rounded-lg self-start">Thinking…</div>
+            <div className="bg-gray-200 text-gray-600 p-3 rounded-lg self-start">
+              Thinking…
+            </div>
           )}
         </div>
       </div>
@@ -161,7 +172,9 @@ export default function Home() {
 
           <div className="text-xs text-gray-500">
             Tip: Ask about today, last week, or a specific date. Example:{' '}
-            <span className="italic">“Have the opening checks been completed?”</span>
+            <span className="italic">
+              “Have the opening checks been completed?”
+            </span>
           </div>
 
           <div className="flex gap-2">
@@ -171,7 +184,10 @@ export default function Home() {
               onChange={(e) => setQuestion(e.target.value)}
               placeholder="Ask a question…"
             />
-            <button className="bg-blue-600 text-white rounded px-4 py-2" disabled={loading}>
+            <button
+              className="bg-blue-600 text-white rounded px-4 py-2"
+              disabled={loading}
+            >
               {loading ? 'Thinking…' : 'Ask'}
             </button>
           </div>

@@ -8,16 +8,23 @@ import { fallbackSqlFor } from '@/utils/fallbackSqlFor';
 const system = `
 You are a MySQL assistant for a read-only analytics API.
 
-- You may only use these tables: temperature, core_temperature, daily_core_temp, daily_hot_hold,
-  hot_holding, daily_check, check, template, wm_check.
-- Use FROM_UNIXTIME() when converting Unix timestamps.
-- "today" means BETWEEN UNIX_TIMESTAMP(CURDATE()) AND UNIX_TIMESTAMP(CURDATE() + INTERVAL 1 DAY) - 1.
-- A check is "completed" if status = 1 OR is_completed = 1.
-- "failed" means status = 0.
+- You may only use these tables: core_temperature, cleaning_frequency, food_cooling,
+  hot_holding, daily_check, fridge_freezer, calibration_probe.
+- Do NOT use: wm_check, temperature, daily_core_temp, daily_hot_hold, \`check\`, template.
+- Use FROM_UNIXTIME() when converting Unix timestamps (e.g., FROM_UNIXTIME(created_at, '%Y-%m-%d %H:%i:%s')).
+- "today" means: BETWEEN UNIX_TIMESTAMP(CURDATE()) AND UNIX_TIMESTAMP(CURDATE() + INTERVAL 1 DAY) - 1.
+- Completion status depends on table:
+  • cleaning_frequency: status 0|1|2 = not started | pending | completed → completed only when status = 2.
+  • core_temperature, hot_holding, fridge_freezer: status 1|0 → completed when status = 1; failed = 0.
+  • daily_check: consider completed if is_completed = 1 OR status = 1 (fallback rule).
 - Always add LIMIT 1000.
-- Restrict every query to the specific restaurant: add WHERE restaurant_id = {restaurantId}.
+- Always restrict to the specific restaurant: add WHERE restaurant_id = {restaurantId}.
 `;
 
+// wm_check, temperature, daily_core_temp, daily_hot_hold, check, template
+// Restaurant ID: 58, 61, 62, 67, 68, 69, 74
+// for core_temperature, hot_holding, fridge_freezer will be status = 1|0
+// cleaning_frequency, status is 0|1|2 => not started|pending|completed 
 // put this near the top of the file (or inside the POST handler if you prefer)
 function toMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -34,11 +41,19 @@ export async function POST(req: NextRequest) {
     }
 
     // Try to auto-detect "restaurant 123" in the question; otherwise use provided or a safe default
-    const m = question.match(/restaurant\s+(\d+)/i);
-    const detectedId = m ? parseInt(m[1], 10) : undefined;
+    // Try to auto-detect restaurant id in the question.
+    // Handles: "restaurant 53", "restaurant id 53", "for restaurant 53", "restaurant: 53"
+    const idMatch =
+      question.match(/\brestaurant\s*id\s*[:=]?\s*(\d+)/i) ||
+      question.match(/\brestaurant\s*[:=]?\s*(\d+)/i);
+    const detectedId = idMatch ? parseInt(idMatch[1], 10) : undefined;
+
+    // If not in the question, allow the client to POST { restaurantId }, else fall back to a default.
+    // You can change the default 53 to any known-good restaurant id for demos.
     const restaurantId: number = Number.isFinite(detectedId)
       ? detectedId!
-      : (Number(bodyRestaurantId) || 53); // <- change 53 to whatever default you prefer
+      : (Number(bodyRestaurantId) || 53);
+
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
@@ -57,7 +72,7 @@ export async function POST(req: NextRequest) {
       sql = (ai.output_text || '').trim();
       if (!/\bLIMIT\b/i.test(sql)) sql += ' LIMIT 1000';
     }
-
+    
     // 3) Guard (you can disable while testing, but recommended to keep on)
     //if (!isSafeSql(sql)) {
     //  return NextResponse.json({ error: 'Generated SQL rejected by guard.' }, { status: 400 });
@@ -99,15 +114,23 @@ export async function POST(req: NextRequest) {
     await conn.end();
 
     // 5) Summarise
+    // 5) Summarise
+    // 5) Summarise (tweaked with per-table completion rules)
     const summary = await openai.responses.create({
       model: 'gpt-4.1-mini',
       input: `Question: ${question}
-SQL: ${sql}
-Rows: ${JSON.stringify(rows).slice(0, 30000)}
-Write a concise, business-friendly answer.
-- If SQL is a COUNT, answer naturally (e.g., "Yes, 12 opening checks have been completed today").
-- If rows include a time column (check_time/start_time/end_time), include it.
-- If no rows, say "No data found."`
+    SQL: ${sql}
+    Rows: ${JSON.stringify(rows).slice(0, 30000)}
+    Write a concise, business-friendly answer.
+
+    Completion rules:
+    - cleaning_frequency: completed only when status = 2 (0 not started, 1 pending, 2 completed).
+    - core_temperature, hot_holding, fridge_freezer: completed when status = 1; failed when status = 0.
+    - daily_check: treat as completed if is_completed = 1 OR status = 1 (fallback rule).
+
+    If SQL is a COUNT, answer naturally (e.g., "Yes, 12 …").
+    If rows include a time column (e.g., check_time/start_time/end_time/created_time), include it.
+    If no rows, say "No data found."`
     });
 
     return NextResponse.json({ answer: summary.output_text, sql, rows, restaurantId });
