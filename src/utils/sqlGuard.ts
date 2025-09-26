@@ -27,15 +27,24 @@ export function validateSql(sql?: string): { ok: boolean; reason?: string } {
   if (DISALLOWED.some(k => new RegExp(`\\b${k}\\b`, 'i').test(q)))
     return { ok: false, reason: 'Disallowed keyword' };
 
-  // Tables mentioned must be allowed
-  const tableMatches = [
-    ...q.matchAll(/\bFROM\s+([a-zA-Z0-9_]+)(?:\s+[a-z])?/gi),
-    ...q.matchAll(/\bJOIN\s+([a-zA-Z0-9_]+)(?:\s+[a-z])?/gi),
-  ];
-  const tables = tableMatches.map(m => m[1].toLowerCase());
-  if (!tables.length) return { ok: false, reason: 'No tables found' };
-  if (!tables.every(t => (ALLOWED_TABLES as readonly string[]).includes(t)))
-    return { ok: false, reason: 'Table not allowed' };
+  // Split UNION ALL into parts and validate each subquery
+  const parts = q.split(/\bUNION\s+ALL\b/i);
+  for (const part of parts) {
+    // Tables must be allowed (support backticks)
+    const tableMatches = [
+      ...part.matchAll(/\bFROM\s+`?([a-zA-Z0-9_]+)`?(?:\s+[a-z])?/gi),
+      ...part.matchAll(/\bJOIN\s+`?([a-zA-Z0-9_]+)`?(?:\s+[a-z])?/gi),
+    ];
+    const tables = tableMatches.map(m => m[1].toLowerCase());
+    if (!tables.length) return { ok: false, reason: 'No tables found' };
+    const bad = tables.find(t => !(ALLOWED_TABLES as readonly string[]).includes(t));
+    if (bad) return { ok: false, reason: `Table not allowed: ${bad}` };
+
+    // Require a restaurant_id predicate inside EACH part
+    if (!/\brestaurant_id\b/i.test(part)) {
+      return { ok: false, reason: 'Missing restaurant filter in subquery' };
+    }
+  }
 
   // Require LIMIT and cap to 1000
   const limit = q.match(/\bLIMIT\s+(\d+)\b/i);

@@ -10,11 +10,11 @@ type Message = {
 };
 
 const EXAMPLES = [
-  'Have the opening checks been completed?',
-  'What temperature checks were completed today and did any fail?',
-  'What checks are outstanding for today?',
-  'Show temperature readings for the last 24 hours.',
-  'How many checks were completed last week?',
+  'Have the opening checks been completed today for restaurant 74',
+  'What temperature checks were completed yesterday for restaurant 74?',
+  'Show temperature checks that failed this week for restaurant 74.',
+  'List outstanding checks today for restaurant 74.',
+  'List outstanding checks today for restaurant 74.',
 ];
 
 export default function Home() {

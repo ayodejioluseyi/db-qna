@@ -1,9 +1,16 @@
+// src/app/api/ask/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
-import mysql from 'mysql2/promise';
-//import { isSafeSql } from '@/utils/sqlGuard';
+import type { RowDataPacket } from 'mysql2/promise';
+import { query } from '@/lib/db';                // ⟵ use your pooled helper
 import { validateSql } from '@/utils/sqlGuard';
 import { fallbackSqlFor } from '@/utils/fallbackSqlFor';
+import { parseDateRange } from '@/utils/parseDateRange';
+
+
+export const runtime = 'nodejs';
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 
 const system = `
 You are a MySQL assistant for a read-only analytics API.
@@ -20,16 +27,39 @@ You are a MySQL assistant for a read-only analytics API.
 - Always add LIMIT 1000.
 - Always restrict to the specific restaurant: add WHERE restaurant_id = {restaurantId}.
 `;
-
-// wm_check, temperature, daily_core_temp, daily_hot_hold, check, template
 // Restaurant ID: 58, 61, 62, 67, 68, 69, 74
-// for core_temperature, hot_holding, fridge_freezer will be status = 1|0
-// cleaning_frequency, status is 0|1|2 => not started|pending|completed 
-// put this near the top of the file (or inside the POST handler if you prefer)
 function toMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   if (typeof err === 'string') return err;
   try { return JSON.stringify(err); } catch { return 'Unknown error'; }
+}
+
+// Simple extractor; you already know this pattern from your code
+function detectRestaurantId(question?: string): number | undefined {
+  if (!question) return undefined;
+  const q = question.toLowerCase();
+  const norm = q
+    .replace(/\bresturant\b/g, 'restaurant')
+    .replace(/\brestuarant\b/g, 'restaurant');
+
+  const m =
+    norm.match(/\brestaurant\s*id\s*[:=]?\s*(\d+)/i) ||
+    norm.match(/\brestaurant\s*[:=]?\s*(\d+)/i) ||
+    norm.match(/\bfor\s+restaurant\s+(\d+)/i);
+
+  return m ? parseInt(m[1], 10) : undefined;
+}
+
+
+// Hard check that SQL contains a restaurant_id predicate for safety
+// Belt & braces: require the resolved restaurantId to appear in a predicate
+function hasRestaurantFilter(sql: string, restaurantId: number): boolean {
+  const id = String(restaurantId);
+  const lower = sql.toLowerCase().replace(/\s+/g, ' ');
+  if (!/\brestaurant_id\b/.test(lower)) return false;
+
+  // cheap but effective: ensure the id appears in an = or IN (...) clause
+  return new RegExp(`restaurant_id\\s*(=|in)\\s*[^;]*\\b${id}\\b`).test(lower);
 }
 
 export async function POST(req: NextRequest) {
@@ -40,27 +70,18 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Question is required' }, { status: 400 });
     }
 
-    // Try to auto-detect "restaurant 123" in the question; otherwise use provided or a safe default
-    // Try to auto-detect restaurant id in the question.
-    // Handles: "restaurant 53", "restaurant id 53", "for restaurant 53", "restaurant: 53"
-    const idMatch =
-      question.match(/\brestaurant\s*id\s*[:=]?\s*(\d+)/i) ||
-      question.match(/\brestaurant\s*[:=]?\s*(\d+)/i);
-    const detectedId = idMatch ? parseInt(idMatch[1], 10) : undefined;
-
-    // If not in the question, allow the client to POST { restaurantId }, else fall back to a default.
-    // You can change the default 53 to any known-good restaurant id for demos.
-    const restaurantId: number = Number.isFinite(detectedId)
-      ? detectedId!
-      : (Number(bodyRestaurantId) || 53);
-
-
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+    // Resolve restaurantId: detect in text → body override → safe default
+    const detected = detectRestaurantId(question);
+    const restaurantId: number = Number.isFinite(detected) ? (detected as number)
+                              : Number(bodyRestaurantId) || 74; // pick your known-good default
+    
+    const dr = parseDateRange(question); // null or { startISO, endISO, label }
 
     // 1) Domain fallback first (fast + predictable)
-    let sql = fallbackSqlFor(question, restaurantId);
+    let sql = fallbackSqlFor(question, restaurantId, dr || undefined);
 
-    // 2) If fallback didn’t have a specific path, ask the model for SQL
+
+    // 2) If fallback didn’t hit, ask the model
     if (!sql) {
       const ai = await openai.responses.create({
         model: 'gpt-4.1-mini',
@@ -72,55 +93,45 @@ export async function POST(req: NextRequest) {
       sql = (ai.output_text || '').trim();
       if (!/\bLIMIT\b/i.test(sql)) sql += ' LIMIT 1000';
     }
-    
-    // 3) Guard (you can disable while testing, but recommended to keep on)
-    //if (!isSafeSql(sql)) {
-    //  return NextResponse.json({ error: 'Generated SQL rejected by guard.' }, { status: 400 });
-    //}
-    // --- Guard + auto-fallback ---
+
+    // 3) Guard + fallback
     let check = validateSql(sql);
     if (!check.ok) {
-      // Try domain-specific fallback if model SQL failed
       const fb = fallbackSqlFor(question, restaurantId);
       if (fb) {
         const fbCheck = validateSql(fb);
         if (fbCheck.ok) {
-          sql = fb;        // use the safe fallback
-          check = fbCheck; // update check result
+          sql = fb;
+          check = fbCheck;
         }
       }
     }
-
     if (!check.ok) {
-      // Return reason + attempted SQL so you can see what failed
       return NextResponse.json(
         { error: 'Generated SQL rejected by guard.', reason: check.reason, sqlAttempt: sql },
         { status: 400 }
       );
     }
-// --- End guard block ---
 
-    // 4) Execute
-    const conn = await mysql.createConnection({
-      host: process.env.DB_HOST!,
-      port: Number(process.env.DB_PORT || 3306),
-      user: process.env.DB_USER!,
-      password: process.env.DB_PASSWORD!,
-      database: process.env.DB_NAME!,
-      connectTimeout: 10000
-    });
+    // 4) Hard-enforce restaurant filter presence (belt & braces)
+    if (!hasRestaurantFilter(sql, restaurantId)) {
+      return NextResponse.json(
+        { error: 'SQL must include a restaurant_id filter for the resolved restaurant.', restaurantId, sqlAttempt: sql },
+        { status: 400 }
+      );
+    }
 
-    const [rows] = await conn.query(sql);
-    await conn.end();
+    // 5) Execute using pooled helper (typed)
+    type AnyRow = RowDataPacket & Record<string, unknown>;
+    const rows = await query<AnyRow[]>(sql);
 
-    // 5) Summarise
-    // 5) Summarise
-    // 5) Summarise (tweaked with per-table completion rules)
+    // 6) Summarise with completion hints (replace the whole input string below)
     const summary = await openai.responses.create({
       model: 'gpt-4.1-mini',
       input: `Question: ${question}
     SQL: ${sql}
     Rows: ${JSON.stringify(rows).slice(0, 30000)}
+
     Write a concise, business-friendly answer.
 
     Completion rules:
@@ -130,17 +141,15 @@ export async function POST(req: NextRequest) {
 
     If SQL is a COUNT, answer naturally (e.g., "Yes, 12 …").
     If rows include a time column (e.g., check_time/start_time/end_time/created_time), include it.
-    If no rows, say "No data found."`
+    If no rows, say "No data found."
+
+    IMPORTANT: If the SQL implies a date range (e.g., DATE(...)=CURDATE() or BETWEEN/>=/< on dates),
+    restate the period clearly in the answer using ISO dates, e.g., "for 2025-09-01 to 2025-09-07".
+    If counts are all zero, say "No temperature checks logged for <table list> in that period for restaurant <id>."`
     });
 
+
     return NextResponse.json({ answer: summary.output_text, sql, rows, restaurantId });
-  //} catch (e: any) {
-  //  console.error('ASK API ERROR:', e);
-  //  return NextResponse.json(
-  //    { error: 'Server error while answering question.', detail: e?.message || String(e) },
-  //    { status: 500 }
-  //  );
-  //}
   } catch (e: unknown) {
     console.error('ASK API ERROR:', e);
     return NextResponse.json(
