@@ -1,13 +1,12 @@
 // src/utils/parseDateRange.ts
 // Parse natural dates in the user's question: 'today', 'yesterday', 'last week',
-// 'on 2025-09-01', 'on 01/09/2025', 'between 2025-09-01 and 2025-09-07' (UK dd/mm also).
-// Returns closed-open [start, end) ISO dates, e.g., start='2025-09-01', end='2025-09-02'.
-// For full-week requests, end = start + 7 days.
+// 'on 2025-09-01', 'on 01/09/2025', 'between 2025-09-01 and 2025-09-07',
+// 'week of 2025-09-15', and 'N days/weeks ago'.
+// Returns closed-open [start, end) ISO dates.
 
-type Range = { startISO: string; endISO: string; label?: string };
+export type Range = { startISO: string; endISO: string; label?: string };
 
 function toISO(d: Date): string {
-  // Force UTC yyyy-mm-dd (avoid tz drift)
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, '0');
   const day = String(d.getUTCDate()).padStart(2, '0');
@@ -20,7 +19,6 @@ function addDaysISO(iso: string, days: number): string {
 }
 function parseISO(s?: string): Date | null {
   if (!s) return null;
-  // yyyy-mm-dd
   const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!m) return null;
   const d = new Date(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`);
@@ -28,7 +26,6 @@ function parseISO(s?: string): Date | null {
 }
 function parseUKDate(s?: string): Date | null {
   if (!s) return null;
-  // dd/mm/yyyy
   const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
   if (!m) return null;
   const [_, dd, mm, yyyy] = m;
@@ -37,7 +34,7 @@ function parseUKDate(s?: string): Date | null {
 }
 
 export function parseDateRange(question?: string): Range | null {
-  const now = new Date(); // use server clock; fine for server-side API usage
+  const now = new Date();
   const todayISO = toISO(now);
   if (!question) return null;
 
@@ -54,14 +51,32 @@ export function parseDateRange(question?: string): Range | null {
     return { startISO: yISO, endISO: todayISO, label: 'yesterday' };
   }
 
-  // last week (Mon–Sun using ISO week can be subjective; we take 7 days prior)
+  // last week (last 7 days ending today start)
   if (/\blast\s+week\b/.test(q)) {
-    const end = addDaysISO(todayISO, 0);        // today start
-    const start = addDaysISO(end, -7);          // 7 days back
+    const end = todayISO;
+    const start = addDaysISO(end, -7);
     return { startISO: start, endISO: end, label: 'last week' };
   }
 
-  // between <date> and <date>  (supports ISO and UK)
+  // N weeks/days ago (single-day window unless you change it)
+  const ago = q.match(/\b(\d+)\s+(week|weeks|day|days)\s+ago\b/);
+  if (ago) {
+    const n = parseInt(ago[1], 10);
+    const unit = ago[2];
+    if (unit.startsWith('day')) {
+      const startISO = addDaysISO(todayISO, -n);
+      const endISO = addDaysISO(todayISO, -n + 1);
+      return { startISO, endISO, label: `${n} days ago` };
+    }
+    // weeks: single day n*7 days back (change to a 7-day window if desired)
+    if (unit.startsWith('week')) {
+      const startISO = addDaysISO(todayISO, -7 * n);
+      const endISO = addDaysISO(startISO, 1);
+      return { startISO, endISO, label: `${n} weeks ago` };
+    }
+  }
+
+  // between <date> and <date> (ISO or UK)
   const between = q.match(/\bbetween\s+([0-9\/\-]+)\s+and\s+([0-9\/\-]+)\b/);
   if (between) {
     const aRaw = between[1], bRaw = between[2];
@@ -69,14 +84,13 @@ export function parseDateRange(question?: string): Range | null {
     const b = parseISO(bRaw) || parseUKDate(bRaw);
     if (a && b) {
       const aISO = toISO(a), bISO = toISO(b);
-      // Make closed-open: end = b + 1 day
       const start = aISO < bISO ? aISO : bISO;
       const end = addDaysISO(aISO < bISO ? bISO : aISO, 1);
       return { startISO: start, endISO: end, label: 'between' };
     }
   }
 
-  // on <date>  (ISO or UK)
+  // on <date> (ISO or UK)
   const on = q.match(/\bon\s+([0-9\/\-]{8,10})\b/);
   if (on) {
     const raw = on[1];

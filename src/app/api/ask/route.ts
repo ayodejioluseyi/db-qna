@@ -71,9 +71,11 @@ export async function POST(req: NextRequest) {
     }
 
     // Resolve restaurantId: detect in text → body override → safe default
+    // Prefer explicit body restaurantId; else detect from text; else default
     const detected = detectRestaurantId(question);
-    const restaurantId: number = Number.isFinite(detected) ? (detected as number)
-                              : Number(bodyRestaurantId) || 74; // pick your known-good default
+    const restaurantId: number =
+      Number(bodyRestaurantId) || (Number.isFinite(detected) ? (detected as number) : 53);
+
     
     const dr = parseDateRange(question); // null or { startISO, endISO, label }
 
@@ -138,6 +140,11 @@ export async function POST(req: NextRequest) {
     - cleaning_frequency: completed only when status = 2 (0 not started, 1 pending, 2 completed).
     - core_temperature, hot_holding, fridge_freezer: completed when status = 1; failed when status = 0.
     - daily_check: treat as completed if is_completed = 1 OR status = 1 (fallback rule).
+
+    Rules:
+    - When the user says "temperature checks", only refer to core_temperature, hot_holding, and fridge_freezer. Do NOT call daily_check "temperature checks".
+    - When summarising daily_check data, do NOT use the phrase "temperature checks".  
+
 
     If SQL is a COUNT, answer naturally (e.g., "Yes, 12 …").
     If rows include a time column (e.g., check_time/start_time/end_time/created_time), include it.
